@@ -29,6 +29,14 @@ from hyperframe.frame import (
     WindowUpdateFrame,
 )
 
+from .boundary import (
+    BodyBoundary,
+    BoundaryEventLog,
+    FailureClass,
+    ReceiveStage,
+    UpstreamRemainder,
+    classify_failure,
+)
 from .config import H2Configuration
 from .errors import ErrorCodes, _error_code_from_int
 from .events import (
@@ -51,6 +59,7 @@ from .exceptions import (
     DenialOfServiceError,
     FlowControlError,
     FrameTooLargeError,
+    InvalidBodyLengthError,
     NoAvailableStreamIDError,
     NoSuchStreamError,
     ProtocolError,
@@ -58,6 +67,7 @@ from .exceptions import (
     StreamClosedError,
     StreamIDTooLowError,
     TooManyStreamsError,
+    TruncatedFrameError,
 )
 from .frame_buffer import FrameBuffer
 from .settings import ChangedSetting, SettingCodes, Settings
@@ -378,6 +388,20 @@ class H2Connection:
 
         # Buffer for incoming data.
         self.incoming_buffer = FrameBuffer(server=not self.config.client_side)
+
+        # Boundary/ownership diagnostics. Disabled by default: when no log is
+        # attached, the receive path keeps its original behaviour and cost.
+        self._boundary_log: BoundaryEventLog | None = None
+        self._boundary_connection_id: str | None = None
+
+        # Set once the connection can never be safely reused: a protocol
+        # error, an unterminated body, or an explicit retirement. A connection
+        # in this state must not be returned to a reuse pool.
+        self._retired_reason: str | None = None
+
+        # The stream the most recent DATA frame belonged to. Used only to
+        # attribute diagnostics when a body crosses its declared boundary.
+        self._last_data_stream_id: int | None = None
 
         # A private variable to store a sequence of received header frames
         # until completion.
@@ -1498,6 +1522,163 @@ class H2Connection:
         for stream in self.streams.values():
             stream._inbound_flow_control_change_from_settings(delta)
 
+    def enable_boundary_diagnostics(self,
+                                    connection_id: str | None = None) -> BoundaryEventLog:
+        """
+        Turn on boundary/ownership diagnostics for this connection and return
+        the log that will receive the events.
+
+        Diagnostics are off by default because they record per-step data that
+        an ordinary protocol stack does not need. Once enabled, every call to
+        :meth:`receive_data` records: how many bytes arrived, the buffer
+        occupancy before and after the call, the declared and confirmed body
+        length for each affected stream, any bytes that were discarded, and
+        the stage a failure happened in. The log never contains body bytes.
+
+        :param connection_id: A stable identifier used in every record to tie
+            an event back to the connection that owned the buffer. Defaults to
+            a per-connection identifier derived from ``id(self)``.
+        :returns: The :class:`BoundaryEventLog
+            <h2.boundary.BoundaryEventLog>` collecting the events.
+        """
+        if connection_id is None:
+            connection_id = self._boundary_connection_id or f"h2-{id(self):x}"
+        self._boundary_connection_id = connection_id
+        self._boundary_log = BoundaryEventLog(connection_id)
+        return self._boundary_log
+
+    @property
+    def boundary_log(self) -> BoundaryEventLog | None:
+        """
+        The active :class:`BoundaryEventLog <h2.boundary.BoundaryEventLog>`,
+        or ``None`` when diagnostics have not been enabled.
+        """
+        return self._boundary_log
+
+    @property
+    def connection_id(self) -> str | None:
+        """
+        The identifier used in boundary diagnostics records, if enabled.
+        """
+        return self._boundary_connection_id
+
+    @property
+    def retired(self) -> bool:
+        """
+        Whether this connection has been marked unusable.
+
+        A retired connection must never be handed back to a reuse pool. This
+        is set when the peer commits a protocol error, when input ends in the
+        middle of a frame, and when a body boundary is violated.
+        """
+        return self._retired_reason is not None
+
+    @property
+    def retire_reason(self) -> str | None:
+        """
+        The stable reason code for why this connection was retired, if it was.
+        """
+        return self._retired_reason
+
+    def retire(self, reason: str) -> None:
+        """
+        Mark this connection as unusable and record why.
+
+        Use this when an out-of-band signal (for example a read timeout, a
+        TLS alert, or an operator decision) means the connection must be
+        dropped instead of reused. The first reason wins, so the original
+        cause is not overwritten by later cleanup.
+
+        :param reason: A short, stable reason code.
+        """
+        if self._retired_reason is None:
+            self._retired_reason = reason
+        self._record_ownership(reason)
+
+    def _record_ownership(self, reason: str) -> None:
+        log = self._boundary_log
+        if log is None:
+            return
+        log.record(
+            ReceiveStage.OWNERSHIP,
+            buffer_before=self.incoming_buffer.buffered_bytes,
+            buffer_after=self.incoming_buffer.buffered_bytes,
+            detail=reason,
+        )
+
+    def body_boundary(self, stream_id: int) -> BodyBoundary | None:
+        """
+        Return the recorded body boundary for ``stream_id``, if diagnostics
+        are enabled and the stream has a boundary.
+
+        :param stream_id: The stream whose boundary should be returned.
+        """
+        if self._boundary_log is None:
+            return None
+        return self._boundary_log.boundary(stream_id)
+
+    def upstream_remainder(self) -> UpstreamRemainder:
+        """
+        Return the bytes this connection currently holds but has not consumed.
+
+        A non-zero ``remaining_bytes`` means the connection is not finished:
+        an upstream response (or a request body) was only partially delivered.
+        Reusing such a connection splices those bytes onto the next exchange.
+        """
+        snapshot = self.incoming_buffer.snapshot()
+        return UpstreamRemainder(
+            connection_id=self._boundary_connection_id or f"h2-{id(self):x}",
+            remaining_bytes=snapshot.buffered_bytes,
+            stage=snapshot.stage,
+        )
+
+    def exchange_finished(self) -> bool:
+        """
+        Whether the last exchange finished in *both* directions.
+
+        This is the condition a connection reuse pool must check: a
+        connection that still has an open stream, or a stream whose local or
+        remote side has not seen ``END_STREAM``, is not safe to hand to the
+        next requester. Checking only one direction is exactly how a response
+        body that is still being received gets spliced onto the next request.
+
+        A connection is considered finished when it is not retired and no
+        stream remains open in either direction.
+
+        .. versionadded:: 4.5.0
+        """
+        if self.retired:
+            return False
+        return not any(stream.open for stream in self.streams.values())
+
+    def body_boundaries_exact(self) -> bool:
+        """
+        Whether every tracked stream's body matched its declared length
+        exactly.
+
+        Streams without a ``content-length`` are treated as unbounded and are
+        not checked; for those, callers should rely on
+        :meth:`upstream_remainder` to confirm that no buffered bytes are left.
+
+        .. versionadded:: 4.5.0
+        """
+        log = self._boundary_log
+        if log is not None:
+            for boundary in log.boundaries().values():
+                if boundary.declared is None:
+                    continue
+                if boundary.confirmed != boundary.declared:
+                    return False
+                if boundary.discarded:
+                    return False
+            return True
+        return all(
+            stream.expected_content_length is None or (
+                stream.expected_content_length == stream.actual_content_length
+            )
+            for stream in self.streams.values()
+        )
+
     def receive_data(self, data: Buffer) -> list[Event]:
         """
         Pass some received HTTP/2 data to the connection for handling.
@@ -1512,25 +1693,222 @@ class H2Connection:
         )
 
         events: list[Event] = []
+        buffer_before = self.incoming_buffer.buffered_bytes
         self.incoming_buffer.add_data(data)
         self.incoming_buffer.max_frame_size = self.max_inbound_frame_size
+        buffer_after_append = self._record_buffer_append(data, buffer_before)
 
         try:
             for frame in self.incoming_buffer:
+                self._record_frame_boundary(frame)
                 events.extend(self._receive_frame(frame))
         except InvalidPaddingError as e:
             self._terminate_connection(ErrorCodes.PROTOCOL_ERROR)
+            self._retired_reason = self._retired_reason or "protocol-error"
+            self._record_receive_failure(e, ReceiveStage.FRAME_BODY)
             msg = "Received frame with invalid padding."
             raise ProtocolError(msg) from e
+        except InvalidBodyLengthError as e:
+            self._handle_body_boundary_error(e)
+            raise
         except ProtocolError as e:
             # For whatever reason, receiving the frame caused a protocol error.
             # We should prepare to emit a GoAway frame before throwing the
             # exception up further. No need for an event: the exception will
             # do fine.
             self._terminate_connection(e.error_code)
+            self._retired_reason = self._retired_reason or "protocol-error"
+            self._record_receive_failure(e, ReceiveStage.FRAME_DISPATCH)
             raise
 
+        self._record_dispatch_complete(buffer_after_append, len(events))
         return events
+
+    def _record_buffer_append(self, data: Buffer, buffer_before: int) -> int:
+        """
+        Record that bytes were appended to the receive buffer, and return the
+        occupancy right after the append.
+
+        When diagnostics are disabled this returns the buffer length directly
+        instead of taking a full snapshot, so the disabled path costs no more
+        than one ``len`` call.
+        """
+        log = self._boundary_log
+        if log is None:
+            return self.incoming_buffer.buffered_bytes
+        snapshot = self.incoming_buffer.snapshot()
+        log.record(
+            ReceiveStage.BUFFER_APPEND,
+            bytes_read=len(memoryview(data)),
+            buffer_before=buffer_before,
+            buffer_after=snapshot.buffered_bytes,
+            declared_length=snapshot.declared_length,
+            detail=snapshot.stage,
+        )
+        return snapshot.buffered_bytes
+
+    def _record_dispatch_complete(self,
+                                  buffer_before: int,
+                                  event_count: int) -> None:
+        """
+        Record the end of one successful receive step.
+        """
+        log = self._boundary_log
+        if log is None:
+            return
+        snapshot = self.incoming_buffer.snapshot()
+        log.record(
+            ReceiveStage.FRAME_DISPATCH,
+            buffer_before=buffer_before,
+            buffer_after=snapshot.buffered_bytes,
+            declared_length=snapshot.declared_length,
+            detail=f"{event_count} event(s), stage {snapshot.stage}",
+        )
+
+    def _handle_body_boundary_error(self, exc: InvalidBodyLengthError) -> None:
+        """
+        Record and react to a request/response body crossing its declared
+        length boundary.
+
+        The bytes past the boundary are discarded rather than delivered, so
+        they must not be left to be mistaken for the start of the next
+        exchange. The connection is retired: its remaining buffer can no
+        longer be trusted to belong to this stream.
+        """
+        self._terminate_connection(exc.error_code)
+        self._retired_reason = self._retired_reason or "body-boundary"
+        log = self._boundary_log
+        if log is None:
+            return
+        log.record(
+            ReceiveStage.BODY,
+            stream_id=self._last_data_stream_id,
+            discarded_bytes=exc.discarded_bytes,
+            declared_length=exc.expected_length,
+            failure=FailureClass.BOUNDARY_ERROR,
+            detail=exc.kind,
+        )
+        snapshot = self.incoming_buffer.snapshot()
+        log.record(
+            ReceiveStage.FAILURE,
+            buffer_after=snapshot.buffered_bytes,
+            failure=FailureClass.BOUNDARY_ERROR,
+            detail=snapshot.stage,
+        )
+
+    def end_of_input(self) -> None:
+        """
+        Tell the connection that the peer will send no more bytes.
+
+        A clean finish (nothing half-buffered) returns normally. If the last
+        :meth:`receive_data` call left a partial frame header, a partial frame
+        body, or a HEADERS block still waiting for CONTINUATION frames, this
+        raises :class:`TruncatedFrameError <h2.exceptions.TruncatedFrameError>`
+        naming the stage the input ended in, and retires the connection.
+
+        This is the counterpart to :meth:`receive_data`: ``StopIteration``
+        inside the frame buffer only ever means "need more data", so callers
+        should call this when they know the stream has finished, rather than
+        treating a silent buffer as a complete exchange.
+
+        .. versionadded:: 4.5.0
+        """
+        snapshot = self.incoming_buffer.snapshot()
+        try:
+            self.incoming_buffer.finish()
+        except TruncatedFrameError as exc:
+            self._retired_reason = self._retired_reason or "truncated-frame"
+            log = self._boundary_log
+            if log is not None:
+                log.record_failure(
+                    ReceiveStage.FAILURE,
+                    FailureClass.BOUNDARY_ERROR,
+                    detail=f"{exc.stage}@{exc.offset}",
+                )
+            raise
+        finally:
+            log = self._boundary_log
+            if log is not None:
+                log.record(
+                    ReceiveStage.OWNERSHIP,
+                    buffer_before=snapshot.buffered_bytes,
+                    buffer_after=self.incoming_buffer.buffered_bytes,
+                    detail="end-of-input",
+                )
+
+    def _record_frame_boundary(self, frame: Frame) -> None:
+        """
+        Record a frame-level boundary event for diagnostics.
+        """
+        log = self._boundary_log
+        if log is None:
+            return
+        snapshot = self.incoming_buffer.snapshot()
+        log.record(
+            ReceiveStage.FRAME_HEADER,
+            stream_id=frame.stream_id or None,
+            buffer_after=snapshot.buffered_bytes,
+            detail=frame.__class__.__name__,
+        )
+
+    def _record_receive_failure(self,
+                                exc: BaseException,
+                                stage: ReceiveStage) -> None:
+        """
+        Record a receive failure under its own stage and classification.
+        """
+        log = self._boundary_log
+        if log is None:
+            return
+        failure = classify_failure(exc)
+        snapshot = self.incoming_buffer.snapshot()
+        log.record_failure(
+            stage,
+            failure,
+            detail=type(exc).__name__,
+        )
+        log.record(
+            ReceiveStage.FAILURE,
+            buffer_after=snapshot.buffered_bytes,
+            declared_length=snapshot.declared_length,
+            failure=failure,
+            detail=snapshot.stage,
+        )
+
+    def record_transport_failure(self, exc: BaseException) -> FailureClass:
+        """
+        Classify an out-of-band transport failure and retire the connection.
+
+        Read timeouts, TLS alerts and similar transport-level problems happen
+        outside :meth:`receive_data`, but they must be recorded in the same
+        event table, because a timeout and a protocol error lead to different
+        pool decisions. This method records the failure under the stage it
+        belongs to and returns its classification.
+
+        :param exc: The transport exception (for example a
+            ``TimeoutError``).
+        :returns: The :class:`FailureClass <h2.boundary.FailureClass>` of
+            ``exc``.
+        """
+        failure = classify_failure(exc)
+        reason = "timeout" if failure is FailureClass.TIMEOUT else "transport-error"
+        self._retired_reason = self._retired_reason or reason
+        log = self._boundary_log
+        if log is not None:
+            snapshot = self.incoming_buffer.snapshot()
+            log.record_failure(
+                ReceiveStage.FAILURE,
+                failure,
+                detail=type(exc).__name__,
+            )
+            log.record(
+                ReceiveStage.OWNERSHIP,
+                buffer_after=snapshot.buffered_bytes,
+                declared_length=snapshot.declared_length,
+                failure=failure,
+                detail="retired-after-transport-failure",
+            )
+        return failure
 
     def _receive_frame(self, frame: Frame) -> list[Event]:
         """
@@ -1748,6 +2126,7 @@ class H2Connection:
 
         try:
             stream = self._get_stream_by_id(frame.stream_id)
+            self._last_data_stream_id = frame.stream_id
             frames, stream_events = stream.receive_data(
                 frame.data,
                 "END_STREAM" in frame.flags,
@@ -1757,6 +2136,18 @@ class H2Connection:
             # This stream is either marked as CLOSED or already gone from our
             # internal state.
             return self._handle_data_on_closed_stream(events, e, frame)
+
+        log = self._boundary_log
+        if log is not None:
+            log.record(
+                ReceiveStage.BODY,
+                stream_id=frame.stream_id,
+                bytes_read=len(frame.data),
+                confirmed_length=len(frame.data),
+                declared_length=stream.expected_content_length,
+                buffer_after=self.incoming_buffer.buffered_bytes,
+                detail="end-stream" if "END_STREAM" in frame.flags else "",
+            )
 
         return frames, events + stream_events
 

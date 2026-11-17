@@ -140,14 +140,130 @@ class InvalidBodyLengthError(ProtocolError):
     indicated.
 
     .. versionadded:: 2.0.0
+
+    .. versionchanged:: 4.5.0
+       Added the ``stage``, ``kind`` and ``remaining`` attributes, so that a
+       body that overruns its declared boundary (``body-overflow``) can be
+       told apart from one that ends before it (``body-underflow``) without
+       inspecting the exception message.
     """
 
-    def __init__(self, expected: int, actual: int) -> None:
+    #: The receive phase in which the boundary was violated.
+    stage = "body-boundary"
+
+    def __init__(self,
+                 expected: int,
+                 actual: int,
+                 discarded: int = 0) -> None:
         self.expected_length = expected
         self.actual_length = actual
+        self.discarded_bytes = discarded
+
+    @property
+    def kind(self) -> str:
+        """
+        A stable, machine-readable classification of this boundary breach.
+        """
+        if self.actual_length > self.expected_length:
+            return "body-overflow"
+        return "body-underflow"
+
+    @property
+    def remaining(self) -> int:
+        """
+        How many declared bytes are still unaccounted for (negative for an
+        overflow).
+        """
+        return self.expected_length - self.actual_length
 
     def __str__(self) -> str:
         return f"InvalidBodyLengthError: Expected {self.expected_length} bytes, received {self.actual_length}"
+
+
+class TruncatedFrameError(ProtocolError):
+    """
+    The peer's input ended before a frame it had already declared was
+    complete.
+
+    This is deliberately a distinct type from
+    :class:`FrameDataMissingError <h2.exceptions.FrameDataMissingError>`: a
+    frame whose body is missing *inside* an otherwise valid frame is a peer
+    protocol error, while input that simply stops mid-frame means the
+    connection can never be safely reused. The ``stage`` attribute says
+    where the input ran out (``frame-header``, ``frame-body`` or
+    ``header-block``), so a diagnostic does not have to infer the phase from
+    the final exception.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: The error code corresponds to this kind of Protocol Error.
+    error_code = ErrorCodes.PROTOCOL_ERROR
+
+    #: The receive phase in which the input ended.
+    stage = "frame-body"
+
+    #: A stable, machine-readable classification.
+    kind = "truncated"
+
+    def __init__(self,
+                 declared_length: int | None = None,
+                 received_length: int = 0,
+                 offset: int = 0,
+                 stage: str | None = None) -> None:
+        self.declared_length = declared_length
+        self.received_length = received_length
+        self.offset = offset
+        if stage is not None:
+            self.stage = stage
+
+    def __str__(self) -> str:
+        declared = (
+            "unknown" if self.declared_length is None
+            else str(self.declared_length)
+        )
+        return (
+            f"TruncatedFrameError: input ended during {self.stage} at byte "
+            f"offset {self.offset}: declared {declared} bytes, received "
+            f"{self.received_length}"
+        )
+
+
+class BoundaryViolationError(H2Error):
+    """
+    A request-body length boundary, an upstream byte remainder, or a buffer
+    ownership hand-off was violated.
+
+    Unlike :class:`ProtocolError <h2.exceptions.ProtocolError>` this does not
+    imply that the wire protocol was malformed: it is raised by the
+    boundary/ownership guards that sit on top of the protocol stack (for
+    example when a gateway tries to reuse a connection whose previous
+    request body was not fully consumed). ``stage`` and ``kind`` carry the
+    stable classification.
+
+    .. versionadded:: 4.5.0
+    """
+
+    def __init__(self,
+                 message: str,
+                 *,
+                 stage: str,
+                 kind: str,
+                 connection_id: str | None = None,
+                 stream_id: int | None = None) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.kind = kind
+        self.connection_id = connection_id
+        self.stream_id = stream_id
+
+    def __str__(self) -> str:
+        location = ""
+        if self.connection_id is not None:
+            location = f" on connection {self.connection_id}"
+        if self.stream_id is not None:
+            location += f" stream {self.stream_id}"
+        return f"BoundaryViolationError[{self.stage}/{self.kind}]{location}: {self.args[0]}"
 
 
 class UnsupportedFrameError(ProtocolError):

@@ -323,3 +323,98 @@ a certain number of bytes have been freed up.
 
 For most applications, this method should be preferred to the manual flow
 control mechanism.
+
+Stream Boundaries and Buffer Ownership
+--------------------------------------
+
+.. versionadded:: 4.5.0
+
+An HTTP/2 connection carries many streams, and a stack that reuses
+connections (an HTTP gateway, a proxy, a connection pool in a client) has to
+answer one question before reuse: is this connection *really* finished?
+
+It is not enough to know that the last request had a ``content-length`` and
+that headers were parsed. Two different quantities matter, and conflating
+them is what lets one exchange's bytes appear in front of the next:
+
+- the **declared body length** of a stream, and how much of it was
+  *confirmed*;
+- the **bytes still physically buffered** on the connection, which nobody
+  has consumed yet.
+
+If the first is used to decide that an exchange is over while the second is
+non-zero, the leftover bytes are handed to the next requester as though they
+were its input. That is the "cross-talk" failure: a concurrent request
+receives somebody else's body.
+
+h2 exposes both quantities separately.
+
+Body boundaries
+~~~~~~~~~~~~~~~
+
+:meth:`H2Connection.body_boundary
+<h2.connection.H2Connection.body_boundary>` returns a
+:class:`BodyBoundary <h2.boundary.BodyBoundary>` for a stream. It contains the
+declared length (``None`` when the peer sent no ``content-length``), the
+confirmed byte count, and the number of discarded bytes. A body that crosses
+its declaration raises :class:`InvalidBodyLengthError
+<h2.exceptions.InvalidBodyLengthError>` with ``kind`` set to
+``"body-overflow"`` or ``"body-underflow"``, the number of bytes still
+outstanding in ``remaining``, and the bytes rejected in ``discarded_bytes``.
+
+Upstream remainders
+~~~~~~~~~~~~~~~~~~~
+
+:meth:`H2Connection.upstream_remainder
+<h2.connection.H2Connection.upstream_remainder>` returns an
+:class:`UpstreamRemainder <h2.boundary.UpstreamRemainder>`: the number of
+bytes buffered and not yet consumed, and the stage they belong to. A
+non-zero remainder means the connection is not finished, regardless of what
+the declared lengths say.
+
+Diagnostics and replay
+~~~~~~~~~~~~~~~~~~~~~~
+
+:meth:`H2Connection.enable_boundary_diagnostics
+<h2.connection.H2Connection.enable_boundary_diagnostics>` attaches a
+:class:`BoundaryEventLog <h2.boundary.BoundaryEventLog>`. Every receive step
+is then recorded with the bytes read, the declared and confirmed length, the
+discarded bytes, the buffer occupancy before and after, the absolute consume
+offset, the stage, and the connection that owns the buffer. Diagnostics are
+off by default and cost nothing when disabled; they never record body bytes.
+
+:mod:`h2.diagnostics` replays a raw capture in three ways — whole, byte by
+byte, and in seeded random fragments — and reports the first receive step at
+which two schedules disagree, together with both schedules' buffer state.
+This makes a boundary check that accidentally depends on read coalescing
+reproducible and locatable.
+
+A worked, offline example lives in ``examples/stream_boundary``.
+
+Connection reuse
+~~~~~~~~~~~~~~~~
+
+:class:`h2.pool.ConnectionPool <h2.pool.ConnectionPool>` refuses to return a
+connection to the reuse pool unless the previous exchange finished in *both*
+directions, every declared body length is exactly confirmed with no discarded
+bytes, and the receive buffer is empty. Each refusal and retirement is
+recorded as a :class:`PoolEvent <h2.pool.PoolEvent>` naming the blocking
+layer, so that cross-talk with reuse enabled can be attributed to a version
+lock, a timeout configuration, or a buffer that was not cleaned up rather
+than guessed at.
+
+If you implement your own pool, call
+:func:`h2.pool.assert_reusable <h2.pool.assert_reusable>` before returning a
+connection; it raises :class:`BoundaryViolationError
+<h2.exceptions.BoundaryViolationError>` naming the failing layer.
+
+End of input
+~~~~~~~~~~~~
+
+:meth:`H2Connection.end_of_input
+<h2.connection.H2Connection.end_of_input>` should be called when the peer
+will send no more bytes. ``StopIteration`` inside the frame buffer only ever
+means "need more data"; if input stopped in the middle of a frame header, a
+frame body, a header block, or the client preface, ``end_of_input`` raises
+:class:`TruncatedFrameError <h2.exceptions.TruncatedFrameError>` naming the
+stage. Never treat a stalled buffer as a complete exchange.

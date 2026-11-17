@@ -11,10 +11,45 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added stream-boundary and buffer-ownership accounting for gateway-style
+  deployments that reuse HTTP/2 connections:
+
+  - ``h2.boundary`` separates the declared request-body length boundary
+    (``BodyBoundary``) from bytes still buffered on a connection
+    (``UpstreamRemainder``), and records both, plus the bytes read, the
+    confirmed length, the discarded bytes, the buffer sizes before and after
+    each step and the consuming connection, in a replayable
+    ``BoundaryEventLog``. Enable it per connection with
+    ``H2Connection.enable_boundary_diagnostics()``. Diagnostics are off by
+    default and change no behaviour when disabled.
+  - ``H2Connection.end_of_input()`` reports input that ends in the middle of
+    a frame as ``TruncatedFrameError`` with the stage
+    (``frame-header``, ``frame-body``, ``header-block`` or ``preamble``)
+    rather than treating a stalled buffer as a clean end of stream.
+    ``FrameBuffer.snapshot()`` exposes the declared length and the bytes
+    received at any fragment boundary, so the check is re-done from the
+    buffer's current contents rather than trusting an earlier read.
+  - ``InvalidBodyLengthError`` gains ``stage``, ``kind`` (``body-overflow``
+    or ``body-underflow``), ``remaining`` and ``discarded_bytes``.
+  - ``H2Connection.retired``/``retire_reason``, ``exchange_finished()``,
+    ``body_boundaries_exact()`` and ``upstream_remainder()`` expose the
+    conditions a connection reuse pool needs.
+  - ``h2.pool.ConnectionPool`` only returns a connection to the reuse pool
+    when the previous exchange finished in both directions, its body
+    boundaries are exact and its buffer is empty. Refusals and retirements
+    are recorded as ``PoolEvent`` values naming the blocking layer
+    (``version-lock``, ``timeout-config``, ``buffer-cleanup``,
+    ``direction-open``, ``body-boundary`` or ``retired``).
+  - ``h2.diagnostics`` replays a raw capture whole, byte by byte, or in
+    seeded random fragments, and reports the first receive step at which two
+    schedules disagree.
 
 **Bugfixes**
 
--
+- ``H2Connection.receive_data`` now records the receive stage before it
+  tears a connection down, and a receive timeout is classified separately
+  from a protocol error. A connection that is retired is never considered
+  reusable.
 
 4.4.1 (2026-08-03)
 ------------------

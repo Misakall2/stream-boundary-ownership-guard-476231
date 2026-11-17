@@ -148,6 +148,65 @@ Protocol Errors
    :show-inheritance:
    :members:
 
+.. autoclass:: h2.exceptions.TruncatedFrameError
+   :show-inheritance:
+   :members:
+
+.. autoclass:: h2.exceptions.BoundaryViolationError
+   :show-inheritance:
+   :members:
+
+
+Boundary and Ownership Diagnostics
+----------------------------------
+
+.. autoclass:: h2.boundary.BodyBoundary
+   :members:
+
+.. autoclass:: h2.boundary.UpstreamRemainder
+   :members:
+
+.. autoclass:: h2.boundary.BoundaryEvent
+   :members:
+
+.. autoclass:: h2.boundary.BoundaryEventLog
+   :members:
+
+.. autofunction:: h2.boundary.classify_failure
+
+.. autoclass:: h2.frame_buffer.FrameBufferState
+   :members:
+
+Connection Reuse Pool
+---------------------
+
+.. autoclass:: h2.pool.ConnectionPool
+   :members:
+
+.. autoclass:: h2.pool.PoolEvent
+   :members:
+
+.. autofunction:: h2.pool.assert_reusable
+
+Replay Harness
+--------------
+
+.. autoclass:: h2.diagnostics.ReplayResult
+   :members:
+
+.. autoclass:: h2.diagnostics.ComparisonResult
+   :members:
+
+.. autoclass:: h2.diagnostics.Divergence
+   :members:
+
+.. autoclass:: h2.diagnostics.ReplayRecord
+   :members:
+
+.. autofunction:: h2.diagnostics.replay
+
+.. autofunction:: h2.diagnostics.compare_schedules
+
 
 HTTP/2 Error Codes
 ------------------

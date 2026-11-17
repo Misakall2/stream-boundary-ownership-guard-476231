@@ -1403,10 +1403,38 @@ class H2Stream:
 
         if expected is not None:
             if expected < actual:
-                raise InvalidBodyLengthError(expected, actual)
+                # This chunk crossed the declared boundary. The frame itself
+                # is rejected as a whole (the caller raises before the
+                # DataReceived event is populated), but the exception records
+                # how many of *this chunk's* bytes would have fitted inside
+                # the boundary and how many overflowed it, so the report can
+                # point at the exact offset rather than only at the totals.
+                fitted = max(0, expected - (actual - length))
+                raise InvalidBodyLengthError(
+                    expected, actual, discarded=length - fitted,
+                )
 
             if end_stream and expected != actual:
                 raise InvalidBodyLengthError(expected, actual)
+
+    @property
+    def expected_content_length(self) -> int | None:
+        """
+        The body length declared by ``content-length`` for this stream, or
+        ``None`` when no such header was sent.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._expected_content_length
+
+    @property
+    def actual_content_length(self) -> int:
+        """
+        The number of body bytes confirmed for this stream so far.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._actual_content_length
 
     def _inbound_flow_control_change_from_settings(self, delta: int) -> None:
         """
